@@ -1,0 +1,10 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本地杂项
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

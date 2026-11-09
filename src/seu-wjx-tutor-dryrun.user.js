@@ -1,27 +1,28 @@
 // ==UserScript==
-// @name         吴健雄学院导师交流预约助手 · 第一阶段（只读）
+// @name         吴健雄学院导师交流 / 文化讲座预约助手
 // @namespace    tutor-communicatiom
-// @version      0.3.0
-// @description  定位目标场次、校准服务器时间、判定报名状态；第二阶段支持预填写与到点自动提交，但默认处于「未武装」状态，不点武装就不会发送任何写入请求。
+// @version      0.4.0
+// @description  定位导师交流或文化讲座目标、校准服务器时间、判定报名状态；支持预填写与到点自动提交，但默认未武装，不点武装不会发送任何写入请求。
 // @match        https://jxsy.seu.edu.cn/wjx/zxyy/xs*
 // @match        https://jxsy.seu.edu.cn/wjx/wx/zxyy/zx*
+// @match        https://jxsy.seu.edu.cn/wjx/syjt*
+// @match        https://jxsy.seu.edu.cn/wjx/wx/syjt*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
 /*
  * =============================================================================
- * 东南大学吴健雄学院 · 导师交流预约助手 —— 第一阶段（只读 / 干跑）
+ * 东南大学吴健雄学院 · 导师交流 / 文化讲座预约助手
  * =============================================================================
  *
- * 这个阶段只做四件事：
- *   1. 调用只读的列表接口，定位目标批次 / 主讲人 / 场次
+ * 默认只做四件事：
+ *   1. 调用只读的列表接口，定位导师场次或讲座
  *   2. 用响应头 Date 估算「服务器时间 - 本地时间」的偏差
- *   3. 判定报名状态（已预约 / 已满 / 未开始 / 已结束 / 可预约 / 已预填写）
+ *   3. 判定报名状态
  *   4. 打印「如果现在提交，会发出什么请求」
  *
- * 它不会调用任何 apply 接口。这条红线在代码里写成了一个显式函数
- * wouldSubmit()：它只返回请求体，不发送。
+ * 未武装时不会调用任何 apply 接口。wouldSubmit() 只返回请求预演，不发送。
  *
  * ---------------------------------------------------------------------------
  * 重要：这个模块有两套完全独立的前端，接口和状态码都不一样
@@ -42,6 +43,10 @@
  *
  * 两套前端共用同一批场次 pid，但状态码语义不同，所以脚本按「前端适配器」
  * 分开建模，再把结果归一化成同一个场次视图给面板和报告使用。
+ *
+ * 文化讲座使用后台的 syjt 模块。「我的报名」页 /wjx/syjt/wdbm 已确认把
+ * 讲座数据放在 kcId 下；实际报名页的子模块名由后台菜单决定，因此脚本从
+ * 当前 syjt 子模块和页面脚本中推导 ajaxList / apply，而不是写死一份。
  *
  * ---------------------------------------------------------------------------
  * 关于鉴权上下文
@@ -225,6 +230,45 @@
     return String(value || '').slice(0, 10);
   }
 
+  function localDateOnly(t) {
+    if (!isFinite(t)) return '';
+    var d = new Date(t);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  function timeOnly(t) {
+    if (!isFinite(t)) return '?';
+    var d = new Date(t);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function nestedValue(obj, path) {
+    var parts = String(path || '').split('.');
+    var cur = obj;
+    for (var i = 0; i < parts.length; i++) {
+      if (cur === null || cur === undefined) return undefined;
+      cur = cur[parts[i]];
+    }
+    return cur;
+  }
+
+  function firstValue(obj, paths) {
+    for (var i = 0; i < paths.length; i++) {
+      var value = nestedValue(obj, paths[i]);
+      if (value !== null && value !== undefined && value !== '') return value;
+    }
+    return undefined;
+  }
+
+  function frontendUrl(frontend, key) {
+    var value = frontend && frontend[key];
+    return typeof value === 'function' ? value.call(frontend) : value;
+  }
+
+  function responseSucceeded(res) {
+    return !!res && (res.code === 0 || (res.code === undefined && res.success === true));
+  }
+
   // ---------------------------------------------------------------- 前端适配器
 
   // 桌面版（layui）
@@ -238,6 +282,9 @@
       3: '报名已结束', 4: '可预约', 5: '已预填写'
     },
     notStarted: 2,
+    needsPhone: true,
+    supportsDraft: true,
+    targetKind: 'tutor',
 
     matches: function () {
       return location.pathname.indexOf('/wjx/zxyy/xs') === 0;
@@ -291,6 +338,17 @@
       };
     },
 
+    buildApplyRequest: function (row, isDraft) {
+      return {
+        url: this.applyUrl,
+        data: {
+          zxxx: row.pid,               // 场次 ID（不是导师 ID）
+          sjhm: config.phone || '',    // 手机号
+          sfzc: isDraft ? 1 : 0        // true = 暂存，false = 正式提交
+        }
+      };
+    },
+
     fetchPage: function (params) {
       var data = {
         page: params.page,
@@ -323,6 +381,9 @@
       1: '已预约', 2: '预约已满', 3: '报名未开始', 4: '报名已结束', 5: '可预约'
     },
     notStarted: 3,
+    needsPhone: true,
+    supportsDraft: true,
+    targetKind: 'tutor',
 
     matches: function () {
       return location.pathname.indexOf('/wjx/wx/zxyy/zx') === 0;
@@ -370,6 +431,17 @@
       };
     },
 
+    buildApplyRequest: function (row, isDraft) {
+      return {
+        url: this.applyUrl,
+        data: {
+          zxxx: row.pid,
+          sjhm: config.phone || '',
+          sfzc: isDraft ? 1 : 0
+        }
+      };
+    },
+
     fetchPage: function (params) {
       return post(this.listUrl, {
         page: params.page,
@@ -392,10 +464,239 @@
     }
   };
 
+  /*
+   * 文化讲座 / 书院讲堂（syjt）
+   *
+   * “我的报名”页路径是 /wjx/syjt/wdbm；实际报名页由后台菜单进入。
+   * 这里不写死具体子路由：只要当前页仍在 syjt 下，就从当前页的
+   * <模块>/ajaxList 和 <模块>/apply 推断接口。这样页面叫 bm、xs 或其他
+   * 子模块都能工作。
+   *
+   * 已确认的数据形态来自“我的报名”页：
+   *   kcId.jztm / kcId.jbsj / kcId.bmkssj / kcId.bmjzsj
+   *   kcId.bmsxrs / kcId.zjr / bmjgzt.value
+   */
+  var CULTURE = {
+    key: 'culture',
+    label: '文化讲座',
+    status: {
+      1: '已报名', 2: '报名已满', 3: '报名未开始',
+      4: '报名已结束', 5: '可报名'
+    },
+    notStarted: 3,
+    needsPhone: false,
+    supportsDraft: false,
+    targetKind: 'lecture',
+
+    matches: function () {
+      return /\/wjx\/(?:wx\/)?syjt(?:\/|$)/.test(location.pathname);
+    },
+
+    routeBase: function () {
+      var path = location.pathname.replace(/\/+$/, '');
+      var marker = path.indexOf('/syjt');
+      var rel = marker >= 0 ? path.slice(marker + 1) : 'syjt/bm';
+      if (/\/wdbm$/.test(rel)) return rel.replace(/\/wdbm$/, '/bm');
+      return rel || 'syjt/bm';
+    },
+
+    isRegistrationPage: function () {
+      return !/\/syjt\/wdbm(?:\/|$)/.test(location.pathname);
+    },
+
+    canScan: function () {
+      return this.isRegistrationPage();
+    },
+
+    guidance: function () {
+      return '当前是「我的报名」，这里只能看已有记录。\n\n'
+        + '请从后台左侧菜单进入文化讲座报名页，脚本会自动识别当前 syjt 子模块。';
+    },
+
+    pageSource: function () {
+      try {
+        return document.documentElement && document.documentElement.innerHTML || '';
+      } catch (e) {
+        return '';
+      }
+    },
+
+    discoveredUrl: function (suffix) {
+      var html = this.pageSource();
+      var re = new RegExp('[\'"]((?:wx/)?syjt/[A-Za-z0-9_./-]+'
+        + suffix + '(?:\\?[^\'"]*)?)[\'"]');
+      var m = re.exec(html);
+      return m ? m[1] : '';
+    },
+
+    listUrl: function () {
+      return this.discoveredUrl('/ajaxList') || (this.routeBase() + '/ajaxList');
+    },
+
+    discoveredApplyUrl: function () {
+      var html = this.pageSource();
+      var re = /['"]((?:wx\/)?syjt\/[A-Za-z0-9_./-]+)(?:\?[^'"]*)?['"]/g;
+      var candidates = [];
+      var m;
+      while ((m = re.exec(html))) {
+        var url = m[1];
+        if (/\/ajaxList$|\/view|\/cancel|\/uploadReport|\/download|\.js$|\.css$/.test(url)) continue;
+        if (candidates.indexOf(url) < 0) candidates.push(url);
+      }
+      var preferred = candidates.filter(function (url) {
+        return /\/apply$|\/register$|\/signup$/.test(url);
+      });
+      return preferred[0] || '';
+    },
+
+    applyUrl: function () {
+      return this.discoveredApplyUrl() || this.discoveredUrl('/apply')
+        || (this.routeBase() + '/apply');
+    },
+
+    loadBatches: function () {
+      return Promise.resolve([]);
+    },
+
+    stateValue: function (row, raw) {
+      var value = firstValue(row, ['bmjgzt.value', 'bmzt.value']);
+      if (value !== undefined) return value;
+      value = firstValue(raw, ['bmjgzt.value', 'bmzt.value']);
+      return value === undefined ? 0 : value;
+    },
+
+    stateLabel: function (row, raw) {
+      var value = firstValue(row, ['bmjgzt.label', 'bmzt.label']);
+      if (value === undefined) value = firstValue(raw, ['bmjgzt.label', 'bmzt.label']);
+      return String(value || '');
+    },
+
+    isMine: function (row, raw) {
+      var value = num(this.stateValue(row, raw));
+      var label = this.stateLabel(row, raw);
+      return value >= 1 || !!row.sfbm || !!row.sfyy || /报名成功|已报名/.test(label);
+    },
+
+    statusOf: function (row, raw, openAt, closeAt, taken, quota) {
+      var value = num(this.stateValue(row, raw));
+      var label = this.stateLabel(row, raw);
+      if (this.isMine(row, raw)) return 1;
+      if (/已满|名额已满/.test(label) || (quota > 0 && taken >= quota)) return 2;
+      var now = serverNow();
+      if (isFinite(openAt) && now < openAt) return 3;
+      if (isFinite(closeAt) && now > closeAt) return 4;
+      return 5;
+    },
+
+    normalize: function (row, params) {
+      var raw = row.kcId || row.course || row.kc || row;
+      var eventAt = ts(firstValue(raw, ['jbsj', 'jzsj', 'kssj'])
+        || firstValue(row, ['jbsj', 'jzsj']));
+      var openAt = ts(firstValue(raw, ['bmkssj']) || firstValue(row, ['bmkssj']));
+      var closeAt = ts(firstValue(raw, ['bmjzsj']) || firstValue(row, ['bmjzsj']));
+      var quota = num(firstValue(raw, ['bmsxrs', 'bmzerenshu'])
+        || firstValue(row, ['bmsxrs', 'bmzerenshu']));
+      var taken = num(firstValue(raw, ['bmyrs', 'bmrs', 'yyrs'])
+        || firstValue(row, ['bmyrs', 'bmrs', 'yyrs']));
+      if (!isFinite(closeAt) && isFinite(openAt)) closeAt = openAt + 3600 * 1000;
+      var code = this.statusOf(row, raw, openAt, closeAt, taken, quota);
+      var coursePid = raw !== row
+        ? firstValue(raw, ['pid', 'id'])
+        : firstValue(row, ['kcid', 'kcIdPid', 'kcPid', 'pid', 'id']);
+      coursePid = coursePid || row.pid;
+      var title = firstValue(raw, ['jztm', 'bt', 'title'])
+        || firstValue(row, ['jztm', 'bt', 'title']) || '未命名讲座';
+      var speaker = firstValue(raw, ['zjr', 'zjrxm', 'lecturer'])
+        || firstValue(row, ['zjr', 'zjrxm', 'lecturer']) || '';
+      var venue = firstValue(raw, ['jzdd', 'dd', 'address'])
+        || firstValue(row, ['jzdd', 'dd', 'address']) || '';
+
+      return {
+        pid: coursePid,
+        bookingPid: row.pid,
+        batchId: '',
+        batchName: '文化讲座',
+        title: title,
+        who: speaker,
+        meta: venue,
+        dateRaw: localDateOnly(eventAt),
+        dateText: fmtDay(eventAt),
+        timeText: timeOnly(eventAt),
+        openAt: openAt,
+        closeAt: closeAt,
+        windowHours: isFinite(openAt) && isFinite(closeAt)
+          ? Math.max(0, (closeAt - openAt) / 3600000) : 0,
+        taken: taken,
+        quota: quota,
+        mine: this.isMine(row, raw),
+        drafted: false,
+        statusCode: code,
+        statusText: this.status[code] || '未知状态',
+        raw: row
+      };
+    },
+
+    /*
+     * 报名页通常会把实际提交键写在 apply 调用附近。先做轻量静态识别；
+     * 找不到时使用 syjt 模块最常见的 kcid。发送两个等价键比误发到
+     * 另一个报名对象安全，后端会忽略未声明字段。
+     */
+    applyFieldNames: function () {
+      var html = this.pageSource();
+      var applyUrl = this.applyUrl();
+      var at = html.indexOf(applyUrl);
+      if (at < 0) at = html.indexOf('/apply');
+      if (at < 0) return [];
+      var sample = html.slice(at, at + 500);
+      var match = /data\s*:\s*\{([^}]*)\}/.exec(sample);
+      if (!match) return [];
+      var names = [];
+      var re = /(?:^|,)\s*([A-Za-z_$][\w$]*)\s*:/g;
+      var m;
+      while ((m = re.exec(match[1]))) {
+        var name = m[1];
+        if (name !== '.me' && /pid|kc|jz|course|^id$/i.test(name) && names.indexOf(name) < 0) {
+          names.push(name);
+        }
+      }
+      return names.slice(0, 6);
+    },
+
+    buildApplyRequest: function (row) {
+      var names = this.applyFieldNames();
+      var data = {};
+      if (!names.length) names = ['kcid', 'pid'];
+      names.forEach(function (name) {
+        data[name] = row.pid;
+      });
+      return { url: this.applyUrl(), data: data };
+    },
+
+    fetchPage: function (params) {
+      return post(this.listUrl(), {
+        page: params.page,
+        limit: params.limit
+      }).then(function (res) {
+        if (!res || res.code !== 0) {
+          throw new Error('接口返回 code=' + (res && res.code) + '，msg=' + (res && res.msg));
+        }
+        var rows = (res.data || []).map(function (row) {
+          return CULTURE.normalize(row, params);
+        });
+        return {
+          rows: rows,
+          totalPages: res.totalPages || 1,
+          count: res.count
+        };
+      });
+    }
+  };
+
   function currentFrontend() {
     var path = location.pathname;
     if (DESKTOP.matches(path)) return DESKTOP;
     if (MOBILE.matches(path)) return MOBILE;
+    if (CULTURE.matches(path)) return CULTURE;
     return null;
   }
 
@@ -410,6 +711,9 @@
 
   // 分页取场次，直到翻完页数或到达上限
   async function collectRows(frontend, pageCount) {
+    if (frontend.canScan && !frontend.canScan()) {
+      throw new Error(frontend.guidance ? frontend.guidance() : '当前页面不能执行扫描');
+    }
     var params = {
       page: 1,
       limit: 50,
@@ -430,7 +734,10 @@
   }
 
   function matchesFilter(row) {
-    if (config.keyword && String(row.who).indexOf(config.keyword) < 0) return false;
+    if (config.keyword) {
+      var haystack = [row.title, row.who, row.meta].join(' ');
+      if (haystack.indexOf(config.keyword) < 0) return false;
+    }
     if (config.date && row.dateRaw !== config.date) return false;
     return true;
   }
@@ -440,12 +747,14 @@
    * 这里只组装请求体，供人核对；真正的发送属于第二阶段，
    * 并且届时也应当由使用者显式开启。
    */
-  function wouldSubmit(frontend, row) {
+  function wouldSubmit(frontend, row, isDraft) {
+    if (frontend.buildApplyRequest) {
+      return frontend.buildApplyRequest(row, !!isDraft).data;
+    }
     return {
-      zxxx: row.pid,               // 场次 ID（不是导师 ID）
-      sjhm: config.phone || '',    // 手机号
-      sfzc: 0                      // false = 正式提交；true = 暂存（预填写）
-      // `.me` 由页面的 $.ajax 包装自动附加，不在请求体里手写
+      zxxx: row.pid,
+      sjhm: config.phone || '',
+      sfzc: isDraft ? 1 : 0
     };
   }
 
@@ -466,31 +775,52 @@
 
   // ---------------------------------------------------------------- 报告
   function buildReport(frontend, row, batchName) {
-    var close = row.openAt + row.windowHours * 3600 * 1000;
+    var close = isFinite(row.closeAt)
+      ? row.closeAt
+      : row.openAt + row.windowHours * 3600 * 1000;
     var lines = [];
 
     lines.push('前端：' + frontend.label);
-    lines.push('批次：' + (row.batchName || batchName || '（未筛选）'));
-    lines.push('主讲人：' + row.who + (row.meta ? '（' + row.meta + '）' : ''));
-    lines.push('场次 pid：' + row.pid);
-    lines.push('预约时间：' + row.dateText + ' ' + row.timeText);
+    if (frontend.targetKind === 'lecture') {
+      lines.push('讲座：' + row.title);
+      lines.push('主讲人：' + (row.who || '—'));
+      if (row.meta) lines.push('地点：' + row.meta);
+      lines.push('讲座 pid：' + row.pid);
+      lines.push('举办时间：' + row.dateText + ' ' + row.timeText);
+    } else {
+      lines.push('批次：' + (row.batchName || batchName || '（未筛选）'));
+      lines.push('主讲人：' + row.who + (row.meta ? '（' + row.meta + '）' : ''));
+      lines.push('场次 pid：' + row.pid);
+      lines.push('预约时间：' + row.dateText + ' ' + row.timeText);
+    }
     lines.push('报名窗口：' + fmt(row.openAt) + ' → ' + fmt(close) + '（' + row.windowHours + ' 小时）');
     lines.push('名额：' + row.taken + '/' + row.quota);
-    lines.push('我的状态：' + (row.mine ? '已预约' : '未预约') + ' / ' + (row.drafted ? '已暂存' : '未暂存'));
+    lines.push('我的状态：' + (row.mine
+      ? (frontend.targetKind === 'lecture' ? '已报名' : '已预约')
+      : (frontend.targetKind === 'lecture' ? '未报名' : '未预约'))
+      + (frontend.supportsDraft ? ' / ' + (row.drafted ? '已暂存' : '未暂存') : ''));
     lines.push('判定：' + row.statusText + '（状态码 ' + row.statusCode + '）');
-    if (!row.quota) lines.push('注意：名额上限是 0，站点会把它判成「已满」。');
+    if (!row.quota) {
+      lines.push(frontend.targetKind === 'lecture'
+        ? '注意：接口没有返回名额上限，状态将主要依据报名时间和报名结果判断。'
+        : '注意：名额上限是 0，站点会把它判成「已满」。');
+    }
     lines.push('距报名开始：' + countdown(row.openAt));
 
-    if (row.statusCode === frontend.notStarted && !row.drafted) {
+    if (frontend.supportsDraft && row.statusCode === frontend.notStarted && !row.drafted) {
       lines.push('提示：站点在此状态提供「预填写」（sfzc=true）。');
       lines.push('      正式开放时只需再发一次 sfzc=false，可以省掉现场填手机号的时间。');
+    } else if (!frontend.supportsDraft) {
+      lines.push('提示：文化讲座没有预填写步骤；到点会直接提交正式报名。');
     }
 
     lines.push('');
     lines.push('⚠ 若此刻提交，会发出：');
-    lines.push('   POST /wjx/' + frontend.applyUrl);
+    lines.push('   POST /wjx/' + frontendUrl(frontend, 'applyUrl'));
     lines.push('   ' + JSON.stringify(wouldSubmit(frontend, row)));
-    lines.push('   （手机号显示为 ' + maskPhone(config.phone) + '；本脚本不会发送这个请求）');
+    lines.push('   （' + (frontend.needsPhone
+      ? '手机号显示为 ' + maskPhone(config.phone) + '；'
+      : '文化讲座不需要手机号；') + '本脚本不会发送这个请求）');
 
     return lines.join('\n');
   }
@@ -550,17 +880,23 @@
    * 重试几十次就会糊满弹窗；它还有一层「相同请求去重」，我们也不需要。
    * 用 fetch 直接发，编码方式与 jQuery 序列化一致，同源自动带 cookie。
    */
-  async function submitApply(pid, isDraft) {
+  async function submitApply(pid, isDraft, row) {
     var frontend = currentFrontend();
     if (!frontend) throw new Error('当前页面不是已知的预约页面');
 
-    var url = siteBasePath() + frontend.applyUrl;
-    var body = formEncode({
-      zxxx: pid,
-      sjhm: config.phone || '',
-      sfzc: isDraft ? 'true' : 'false',
-      '.me': siteModuleId()
-    });
+    var targetRow = row || arm.row || { pid: pid };
+    var request = frontend.buildApplyRequest
+      ? frontend.buildApplyRequest(targetRow, !!isDraft)
+      : {
+        url: frontend.applyUrl,
+        data: { zxxx: pid, sjhm: config.phone || '', sfzc: isDraft ? 1 : 0 }
+      };
+    var data = Object.assign({}, request.data, { '.me': siteModuleId() });
+    if (Object.prototype.hasOwnProperty.call(data, 'sfzc')) {
+      data.sfzc = data.sfzc ? 'true' : 'false';
+    }
+    var url = siteBasePath() + request.url;
+    var body = formEncode(data);
 
     var t0 = Date.now();
     var res = await fetch(url, {
@@ -595,7 +931,7 @@
     if (!row) return;
     arm.pid = row.pid;
     arm.row = row;
-    arm.label = row.who + ' · ' + row.dateText + ' ' + row.timeText;
+    arm.label = (row.title || row.who) + ' · ' + row.dateText + ' ' + row.timeText;
     arm.tOpen = row.openAt;
     arm.tLate = row.openAt + Math.max(0, clockOffsetMs);
     arm.stopAt = arm.tLate + STOP_MARGIN_MS;
@@ -604,13 +940,19 @@
   }
 
   function updateArmState() {
+    if (ui.modeTag) {
+      var kind = ui.frontend && ui.frontend.targetKind === 'lecture' ? '讲座' : '导师';
+      ui.modeTag.textContent = kind + ' · '
+        + (arm.armed ? '已武装' : arm.done ? '已完成' : '未武装');
+    }
     if (!ui.armState) return;
     if (!arm.pid) {
       ui.armState.textContent = '未设定目标。先扫描，再点「设为目标」。';
       return;
     }
     var lines = ['目标：' + arm.label];
-    lines.push('场次 pid：' + arm.pid);
+    lines.push((ui.frontend && ui.frontend.targetKind === 'lecture' ? '讲座 pid：' : '场次 pid：')
+      + arm.pid);
     if (arm.armed) {
       var now = serverNow();
       lines.push('状态：已武装（已尝试 ' + arm.attempts + ' 次，失败 ' + arm.errors + ' 次）');
@@ -723,7 +1065,7 @@
 
     try {
       var res = await submitApply(arm.pid, false);
-      if (res && res.code === 0) {
+      if (responseSucceeded(res)) {
         succeeded = true;
         arm.done = true;
         appendLog('✅ 提交成功（第 ' + arm.attempts + ' 次）：' + (res.msg || 'ok'));
@@ -769,8 +1111,8 @@
         return;
       }
       appendLog(hit.mine
-        ? '回读确认：服务端已显示「已预约」。'
-        : '回读确认：服务端还没显示「已预约」，请手动核对。');
+        ? '回读确认：服务端已显示「' + (frontend.targetKind === 'lecture' ? '已报名' : '已预约') + '」。'
+        : '回读确认：服务端还没显示「' + (frontend.targetKind === 'lecture' ? '已报名' : '已预约') + '」，请手动核对。');
     } catch (e) {
       appendLog('回读确认失败：' + (e && e.message ? e.message : e));
     }
@@ -781,16 +1123,16 @@
       appendLog('请先「设为目标」。');
       return;
     }
-    if (!/^1[3-9]\d{9}$/.test(config.phone || '')) {
+    var frontend = currentFrontend();
+    if (frontend.needsPhone && !/^1[3-9]\d{9}$/.test(config.phone || '')) {
       appendLog('手机号没填或格式不对，先补上再武装。');
       return;
     }
-    var frontend = currentFrontend();
     var preview = JSON.stringify(wouldSubmit(frontend, arm.row));
     var ok = window.confirm(
       '将在报名开始的瞬间自动提交下面的请求，可能会重复尝试几十次：\n\n'
       + '目标：' + arm.label + '\n'
-      + 'POST ' + siteBasePath() + frontend.applyUrl + '\n'
+      + 'POST ' + siteBasePath() + frontendUrl(frontend, 'applyUrl') + '\n'
       + preview + '\n\n'
       + '到点前请保持此标签页在前台。\n\n确定武装吗？'
     );
@@ -822,6 +1164,11 @@
       appendLog('请先「设为目标」。');
       return;
     }
+    var frontend = currentFrontend();
+    if (!frontend.supportsDraft) {
+      appendLog('文化讲座没有「预填写」步骤；到点直接武装并提交即可。');
+      return;
+    }
     if (!/^1[3-9]\d{9}$/.test(config.phone || '')) {
       appendLog('手机号没填或格式不对。');
       return;
@@ -834,7 +1181,7 @@
     if (!ok) return;
     try {
       var res = await submitApply(arm.pid, true);
-      appendLog(res && res.code === 0
+      appendLog(responseSucceeded(res)
         ? '预填写成功：' + (res.msg || 'ok')
         : '预填写失败：' + ((res && res.msg) || ('code=' + (res && res.code))));
     } catch (e) {
@@ -855,15 +1202,15 @@
       appendLog('请先「设为目标」。');
       return;
     }
-    if (!/^1[3-9]\d{9}$/.test(config.phone || '')) {
+    var frontend = currentFrontend();
+    if (frontend.needsPhone && !/^1[3-9]\d{9}$/.test(config.phone || '')) {
       appendLog('手机号没填或格式不对。');
       return;
     }
-    var frontend = currentFrontend();
     var ok = window.confirm(
       '立即提交一次，不等时间窗口：\n\n'
       + '目标：' + arm.label + '\n'
-      + 'POST ' + siteBasePath() + frontend.applyUrl + '\n'
+      + 'POST ' + siteBasePath() + frontendUrl(frontend, 'applyUrl') + '\n'
       + JSON.stringify(wouldSubmit(frontend, arm.row)) + '\n\n'
       + '这会发出一笔真实的报名请求。如果目标是已满或已结束的场次，\n'
       + '服务端会拒绝它 —— 拒绝恰好可以用来验证链路是通的。\n\n确定吗？'
@@ -872,7 +1219,7 @@
     try {
       var res = await submitApply(arm.pid, false);
       appendLog('手动提交返回：' + JSON.stringify(res));
-      if (res && res.code === 0) await verifyBooked();
+      if (responseSucceeded(res)) await verifyBooked();
     } catch (e) {
       appendLog('手动提交异常：' + (e && e.message ? e.message : e));
     }
@@ -926,16 +1273,16 @@
     wrap.className = 'wrap';
     wrap.innerHTML = [
       '<div class="hd">',
-      '  <span>导师交流预约助手</span>',
-      '  <span class="tag">只读 · 干跑</span>',
+      '  <span id="panelTitle">预约助手</span>',
+      '  <span class="tag" id="modeTag">只读 · 干跑</span>',
       '  <span class="grow"></span>',
       '  <button id="toggle" title="折叠/展开">—</button>',
       '</div>',
       '<div class="bd" id="body">',
-      '  <label><span>批次</span><select id="batch"></select></label>',
-      '  <label><span>主讲人（支持部分匹配，留空=第一条）</span><input id="keyword"></label>',
-      '  <label><span>目标预约日期（YYYY-MM-DD，留空=第一条）</span><input id="date"></label>',
-      '  <label><span>手机号（仅用于预演请求体）</span><input id="phone"></label>',
+      '  <label id="batchField"><span id="batchLabel">批次</span><select id="batch"></select></label>',
+      '  <label><span id="keywordLabel">主讲人（支持部分匹配，留空=第一条）</span><input id="keyword"></label>',
+      '  <label><span id="dateLabel">目标预约日期（YYYY-MM-DD，留空=第一条）</span><input id="date"></label>',
+      '  <label id="phoneField"><span id="phoneLabel">手机号（仅用于预演请求体）</span><input id="phone"></label>',
       '  <label><span>轮询间隔（秒，下限 2）</span><input id="interval" type="number" min="2"></label>',
       '  <div class="row">',
       '    <button id="scan">单次扫描</button>',
@@ -957,7 +1304,7 @@
       '  <div class="armState" id="armState">未设定目标</div>',
       '  <div class="clock" id="clock">时钟：未校准</div>',
       '  <pre id="log"></pre>',
-      '  <div class="note">未武装时只调用列表接口（查询）。武装后才会调用 apply。</div>',
+      '  <div class="note">未武装时只调用列表接口（查询）。武装后才会调用 apply。导师交流与文化讲座共用同一套安全边界。</div>',
       '</div>'
     ].join('');
     root.appendChild(wrap);
@@ -980,6 +1327,30 @@
     ui.body = ui.$('body');
     ui.clock = ui.$('clock');
     ui.log = ui.$('log');
+    ui.panelTitle = ui.$('panelTitle');
+    ui.modeTag = ui.$('modeTag');
+    ui.batchField = ui.$('batchField');
+    ui.batchLabel = ui.$('batchLabel');
+    ui.keywordLabel = ui.$('keywordLabel');
+    ui.dateLabel = ui.$('dateLabel');
+    ui.phoneField = ui.$('phoneField');
+    ui.phoneLabel = ui.$('phoneLabel');
+    ui.frontend = frontend;
+
+    if (frontend.targetKind === 'lecture') {
+      if (ui.panelTitle) ui.panelTitle.textContent = '文化讲座报名助手';
+      if (ui.modeTag) ui.modeTag.textContent = '讲座 · 未武装';
+      if (ui.batchField) ui.batchField.style.display = 'none';
+      if (ui.keywordLabel) ui.keywordLabel.textContent = '讲座题目 / 主讲人（支持部分匹配，留空=第一条）';
+      if (ui.dateLabel) ui.dateLabel.textContent = '举办日期（YYYY-MM-DD，留空=第一条）';
+      if (ui.phoneField) ui.phoneField.style.display = 'none';
+      if (ui.prefill) {
+        ui.prefill.disabled = true;
+        ui.prefill.title = '文化讲座不需要预填写';
+      }
+    } else {
+      if (ui.panelTitle) ui.panelTitle.textContent = '导师交流预约助手';
+    }
 
     ui.keyword.value = config.keyword;
     ui.date.value = config.date;
@@ -1091,7 +1462,9 @@
       var picked = rows.filter(matchesFilter);
 
       if (!rows.length) {
-        setLog('这个批次下没有查到任何场次。\n\n'
+        setLog((frontend.targetKind === 'lecture'
+          ? '当前报名页没有查到任何讲座。'
+          : '这个批次下没有查到任何场次。') + '\n\n'
           + '前端：' + frontend.label + '\n批次：' + (config.batch || '（全部）')
           + '\n\n要么场次还没发布，要么该批次已经结束。'
           + '持续监视会在场次出现时自动报告。');
@@ -1099,7 +1472,7 @@
       }
       if (!picked.length) {
         setLog('查到 ' + rows.length + ' 条场次，但没有匹配当前筛选条件的。\n\n'
-          + '主讲人关键词：' + (config.keyword || '（无）')
+          + '关键词：' + (config.keyword || '（无）')
           + '\n目标日期：' + (config.date || '（无）'));
         return null;
       }
@@ -1166,6 +1539,7 @@
     submitApply: submitApply,
     setTarget: setTarget,
     armTarget: armTarget,
+    prefillTarget: prefillTarget,
     disarm: disarm,
     submitOnce: submitOnce,
     getArm: function () { return arm; },

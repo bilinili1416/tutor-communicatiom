@@ -157,7 +157,7 @@ function fmtLocal(ms) {
 }
 
 // ------------------------------------------------------------------ 运行器
-async function runScenario({ pathname, pcs, clock, handler, fetchHandler, confirmResult, seedConfig }) {
+async function runScenario({ pathname, pcs, clock, handler, fetchHandler, confirmResult, seedConfig, pageHtml }) {
   const ajaxCalls = [];
   const fetchCalls = [];
   const storage = {};
@@ -210,7 +210,8 @@ async function runScenario({ pathname, pcs, clock, handler, fetchHandler, confir
     document: {
       body: makeElement(),
       createElement: () => makeElement(),
-      querySelector: (sel) => (sel === 'title' ? makeTitleElement() : null)
+      querySelector: (sel) => (sel === 'title' ? makeTitleElement() : null),
+      documentElement: { innerHTML: pageHtml || '' }
     },
     localStorage: {
       getItem: (k) => (k in storage ? storage[k] : null),
@@ -444,6 +445,138 @@ check('取消之后依然没有写请求', mobile.fetchCalls.length === 0,
   JSON.stringify(mobile.fetchCalls));
 await mobile.api.submitOnce();
 check('取消确认时手动提交同样不发请求', mobile.fetchCalls.length === 0);
+
+// ================================================================ 场景三：文化讲座
+console.log('\n场景三：文化讲座 /wjx/syjt/bm');
+
+const cultureClock = createClock(RealDate.now());
+const cultureOpenAt = cultureClock.now() + 230 * 1000 + 30 * 1000;
+let cultureBooked = false;
+
+const culture = await runScenario({
+  pathname: '/wjx/syjt/bm',
+  clock: cultureClock,
+  confirmResult: true,
+  seedConfig: { keyword: '国歌', intervalSec: 5 },
+  handler(url) {
+    if (url === 'syjt/bm/ajaxList') {
+      return {
+        code: 0,
+        totalPages: 1,
+        count: 1,
+        data: [{
+          pid: 'booking-1',
+          kcId: {
+            pid: 2101,
+            jztm: '我们的国歌——《义勇军进行曲》背后的故事',
+            zjr: '章世和',
+            jzdd: '健雄书院报告厅',
+            jbsj: fmtLocal(cultureOpenAt + 2 * HOUR),
+            bmkssj: fmtLocal(cultureOpenAt),
+            bmjzsj: fmtLocal(cultureOpenAt + 2 * HOUR),
+            bmsxrs: 60
+          },
+          bmjgzt: { label: cultureBooked ? '报名成功' : '未报名', value: cultureBooked ? 1 : 0 }
+        }]
+      };
+    }
+    throw new Error('unexpected url ' + url);
+  },
+  fetchHandler(url) {
+    if (url !== '/wjx/syjt/bm/apply') throw new Error('unexpected apply url ' + url);
+    cultureBooked = true;
+    return { code: 0, msg: '报名成功', success: true };
+  }
+});
+
+check('识别为文化讲座前端', culture.api.frontend() && culture.api.frontend().key === 'culture');
+
+before = culture.api.getLog().length;
+const cultureRow = await culture.api.runScan(true);
+report = tail(culture.api, before);
+check('文化讲座扫描返回课程 ID', cultureRow && Number(cultureRow.pid) === 2101,
+  cultureRow && String(cultureRow.pid));
+check('报告展示讲座标题', report.includes('《义勇军进行曲》') && report.includes('章世和'), report);
+check('文化讲座按时间判为报名未开始', report.includes('报名未开始（状态码 3）'), report);
+check('文化讲座预览地址自动来自 syjt/bm',
+  report.includes('POST /wjx/syjt/bm/apply'), report);
+check('文化讲座预览不需要手机号', report.includes('文化讲座不需要手机号') && !report.includes('"sjhm"'), report);
+check('未武装时没有讲座写请求', culture.fetchCalls.length === 0);
+
+culture.api.setTarget(cultureRow);
+await culture.api.prefillTarget();
+check('文化讲座拒绝预填写且不发请求', culture.fetchCalls.length === 0
+  && culture.api.getLog().includes('没有「预填写」步骤'));
+
+culture.api.armTarget();
+check('文化讲座无需手机号即可武装', culture.api.getArm().armed === true);
+await cultureClock.advance(35 * 1000);
+check('文化讲座到点后提交成功并停止', culture.api.getArm().done === true
+  && culture.api.getArm().armed === false);
+check('文化讲座提交了课程 ID', culture.fetchCalls.some((c) =>
+  c.url === '/wjx/syjt/bm/apply' && c.body.includes('kcid=2101') && !c.body.includes('sjhm=')),
+JSON.stringify(culture.fetchCalls));
+check('文化讲座请求带当前模块 .me', culture.fetchCalls.some((c) =>
+  c.body.includes('.me=TEST_MODULE_ID')));
+check('文化讲座命中后回读确认已报名', culture.api.getLog().includes('服务端已显示「已报名」'));
+
+const cultureSettled = culture.fetchCalls.length;
+await cultureClock.advance(30 * 1000);
+check('文化讲座成功后彻底停手', culture.fetchCalls.length === cultureSettled);
+
+// “我的报名”页不能误用当前模块 ID 去武装
+const cultureMineClock = createClock(RealDate.now());
+const cultureMine = await runScenario({
+  pathname: '/wjx/syjt/wdbm',
+  clock: cultureMineClock,
+  handler() { throw new Error('不应请求接口'); }
+});
+before = cultureMine.api.getLog().length;
+check('「我的报名」页拒绝扫描', await cultureMine.api.runScan(true) === null);
+check('「我的报名」页提示进入报名页',
+  tail(cultureMine.api, before).includes('请从后台左侧菜单进入文化讲座报名页'));
+check('「我的报名」页没有任何写请求', cultureMine.fetchCalls.length === 0);
+
+// 报名页子模块名变化时，从页面脚本里的固定 URL 自动识别
+console.log('\n场景四：文化讲座页面自动识别子路由');
+const cultureDynamicClock = createClock(RealDate.now());
+const cultureDynamicOpenAt = cultureDynamicClock.now() + 230 * 1000 + 40 * 1000;
+const cultureDynamic = await runScenario({
+  pathname: '/wjx/syjt/bm',
+  clock: cultureDynamicClock,
+  seedConfig: { keyword: '南京' },
+  pageHtml: [
+    '<script>',
+    '$.ajax({url: "syjt/xs/ajaxList"});',
+    '$.ajax({url: "syjt/xs/apply", data: {jzid: data.kcId.pid}});',
+    '</script>'
+  ].join(''),
+  handler(url) {
+    if (url !== 'syjt/xs/ajaxList') throw new Error('unexpected url ' + url);
+    return {
+      code: 0, totalPages: 1, count: 1,
+      data: [{
+        pid: 2102,
+        kcId: {
+          pid: 2202, jztm: '爱上南京，我们的城市我们的家', zjr: '胡阿祥',
+          jbsj: fmtLocal(cultureDynamicOpenAt + HOUR),
+          bmkssj: fmtLocal(cultureDynamicOpenAt),
+          bmjzsj: fmtLocal(cultureDynamicOpenAt + HOUR),
+          bmsxrs: 75
+        },
+        bmjgzt: { value: 0, label: '未报名' }
+      }]
+    };
+  }
+});
+const dynamicRow = await cultureDynamic.api.runScan(true);
+const dynamicReport = cultureDynamic.api.getLog();
+check('自动采用页面声明的 ajaxList', dynamicRow && Number(dynamicRow.pid) === 2202,
+  dynamicRow && String(dynamicRow.pid));
+check('自动采用页面声明的 apply 地址', dynamicReport.includes('POST /wjx/syjt/xs/apply'),
+  dynamicReport);
+check('自动识别报名参数名 jzid', dynamicReport.includes('"jzid":2202'), dynamicReport);
+check('动态识别过程中仍不写请求', cultureDynamic.fetchCalls.length === 0);
 
 // ================================================================
 console.log('\n' + passed + ' 项通过，' + failures.length + ' 项失败');
